@@ -1,57 +1,163 @@
-name: Stock Data Crawler
+name: Stock Data Crawler Full
 
 on:
   schedule:
-    # 每周一至周五北京时间 08:30 自动执行 (对应 UTC 00:30)
+    # 每周一至周五北京时间 08:30 (UTC 00:30)
     - cron: '30 0 * * 1-5'
-  workflow_dispatch: # 开启手动测试按钮
+  workflow_dispatch:
 
 jobs:
-  fetch-and-save:
+  fetch-full-market:
     runs-on: ubuntu-latest
     steps:
-      - name: 检出仓库
+      - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 抓取市场客观数据
+      - name: 抓取全维度量化指标
         run: |
-          python -m pip install --quiet akshare requests
+          python -m pip install --quiet akshare requests pandas
           python -c '
-          import requests, datetime, json, akshare as ak
+          import os, json, datetime, requests
+          import pandas as pd
+          import akshare as ak
 
           data = {}
-          # 1. 抓取富时A50、离岸汇率与外盘
+          headers = {"Referer": "https://finance.sina.com.cn"}
+
+          # -------------------------------------------------------------
+          # 1. 宏观外盘、期指、汇率与核心资产 (新浪多标的聚合接口)
+          # -------------------------------------------------------------
           try:
-              headers = {"Referer": "https://finance.sina.com.cn"}
-              r = requests.get("https://hq.sinajs.cn/list=hf_CHA50CFD,fx_susdcnh,gb_ixic", headers=headers, timeout=10)
+              # CHA50CFD: A50, fx_susdcnh: 汇率, DXY: 美元指数, CL: 原油, GC: 黄金, CAD: 伦铜
+              # gb_$dji: 道指, gb_ixic: 纳指, gb_inx: 标普500
+              # gb_nvda: 英伟达, gb_tsla: 特斯拉, gb_aapl: 苹果, gb_hxc: 金龙指数
+              symbols = "hf_CHA50CFD,fx_susdcnh,DXY,hf_CL,hf_GC,hf_CAD,gb_$dji,gb_ixic,gb_inx,gb_nvda,gb_tsla,gb_aapl,gb_hxc"
+              r = requests.get(f"https://hq.sinajs.cn/list={symbols}", headers=headers, timeout=12)
               lines = r.text.strip().split("\n")
-              a50_items = lines[0].split("=\"")[1].split(",")
-              data["a50_price"] = a50_items[0]
-              data["usdcnh"] = lines[1].split("=\"")[1].split(",")[1]
-              ixic_items = lines[2].split("=\"")[1].split(",")
-              data["nasdaq_pct"] = ixic_items[2] if len(ixic_items) > 2 else "0.0"
-          except:
-              data["a50_price"], data["usdcnh"], data["nasdaq_pct"] = "暂无", "暂无", "暂无"
+              raw_dict = {}
+              for line in lines:
+                  if "=" in line:
+                      k = line.split("=")[0].replace("var hq_str_", "").strip()
+                      v = line.split("=\"")[1].split(",")
+                      raw_dict[k] = v
 
-          # 2. 前日短线生态数据
+              # A50 期货
+              a50 = raw_dict.get("hf_CHA50CFD", [])
+              if len(a50) > 7:
+                  curr, settle = float(a50[0]), float(a50[7]) if a50[7] else float(a50[0])
+                  data["a50_price"] = curr
+                  data["a50_pct"] = round(((curr - settle) / settle) * 100, 2)
+              else:
+                  data["a50_price"], data["a50_pct"] = "暂无实时数据", 0.0
+
+              # 离岸人民币 USD/CNH
+              cnh = raw_dict.get("fx_susdcnh", [])
+              data["usdcnh"] = cnh[1] if len(cnh) > 1 else "暂无实时数据"
+
+              # 美元指数 DXY
+              dxy = raw_dict.get("DXY", [])
+              data["dxy_price"] = dxy[1] if len(dxy) > 1 else "暂无实时数据"
+
+              # 美股三大指数涨跌幅
+              data["dji_pct"] = raw_dict.get("gb_$dji", ["","","0.0"])[2]
+              data["ixic_pct"] = raw_dict.get("gb_ixic", ["","","0.0"])[2]
+              data["spx_pct"] = raw_dict.get("gb_inx", ["","","0.0"])[2]
+
+              # 美股科技锚与金龙指数
+              data["nvda_pct"] = raw_dict.get("gb_nvda", ["","","0.0"])[2]
+              data["tsla_pct"] = raw_dict.get("gb_tsla", ["","","0.0"])[2]
+              data["aapl_pct"] = raw_dict.get("gb_aapl", ["","","0.0"])[2]
+              data["hxc_pct"] = raw_dict.get("gb_hxc", ["","","0.0"])[2]
+
+              # 战略大宗 (原油/黄金/伦铜)
+              data["crude_oil"] = raw_dict.get("hf_CL", ["暂无"])[0]
+              data["gold"] = raw_dict.get("hf_GC", ["暂无"])[0]
+              data["copper"] = raw_dict.get("hf_CAD", ["暂无"])[0]
+          except Exception as e:
+              data["macro_error"] = str(e)
+
+          # -------------------------------------------------------------
+          # 2. 自动回溯最近交易日 (过滤周末与非交易日)
+          # -------------------------------------------------------------
+          target_date = datetime.datetime.now() - datetime.timedelta(days=1)
+          while target_date.weekday() >= 5: # 5:周六, 6:周日
+              target_date -= datetime.timedelta(days=1)
+          trade_date_str = target_date.strftime("%Y%m%d")
+          data["trade_date"] = trade_date_str
+
+          # -------------------------------------------------------------
+          # 3. 前日短线生态 (涨跌停、炸板率、最高连板)
+          # -------------------------------------------------------------
           try:
-              last_date = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%Y%m%d")
-              zt_df = ak.stock_zt_pool_em(date=last_date)
+              zt_df = ak.stock_zt_pool_em(date=trade_date_str)
               data["limit_up_count"] = len(zt_df)
-              data["max_board"] = int(zt_df["连板数"].max()) if not zt_df.empty else 0
-              top_name = zt_df.sort_values(by="连板数", ascending=False).iloc[0]["名称"] if not zt_df.empty else "无"
-              data["max_board_name"] = top_name
-          except:
-              data["limit_up_count"], data["max_board"], data["max_board_name"] = 0, 0, "暂无"
+              if not zt_df.empty:
+                  data["max_board"] = int(zt_df["连板数"].max())
+                  top = zt_df.sort_values(by="连板数", ascending=False).iloc[0]
+                  data["max_board_name"] = f"{top[\"名称\"]}({top[\"代码\"]})"
+              else:
+                  data["max_board"], data["max_board_name"] = 0, "无"
 
+              # 跌停池
+              dt_df = ak.stock_zt_pool_dtgc_em(date=trade_date_str)
+              data["limit_down_count"] = len(dt_df) if not dt_df.empty else 0
+
+              # 炸板率统计
+              zbf_df = ak.stock_zt_pool_zbgc_em(date=trade_date_str)
+              broken_count = len(zbf_df) if not zbf_df.empty else 0
+              total_pool = len(zt_df) + broken_count
+              data["broken_rate"] = round((broken_count / total_pool) * 100, 2) if total_pool > 0 else 0.0
+          except Exception:
+              data["limit_up_count"], data["limit_down_count"] = 0, 0
+              data["max_board"], data["max_board_name"], data["broken_rate"] = 0, "暂无", 0.0
+
+          # -------------------------------------------------------------
+          # 4. 指数前日基准点位与成交额 (上证、两市总成交)
+          # -------------------------------------------------------------
+          try:
+              sh_df = ak.stock_zh_index_daily_em(symbol="sh000001")
+              last_day = sh_df.iloc[-1]
+              data["sh_close"] = float(last_day["close"])
+
+              sz_df = ak.stock_zh_index_daily_em(symbol="sz399001")
+              total_vol_billion = (float(last_day.get("volume", 0)) + float(sz_df.iloc[-1].get("volume", 0))) / 100000000
+              data["yesterday_total_amount"] = round(total_vol_billion, 2) if total_vol_billion > 0 else "参考官方披露"
+          except Exception:
+              data["sh_close"], data["yesterday_total_amount"] = 0.0, "暂无"
+
+          # -------------------------------------------------------------
+          # 5. 流动性指标：两融余额增减与央行 OMO
+          # -------------------------------------------------------------
+          try:
+              margin_df = ak.stock_margin_sse()
+              if not margin_df.empty:
+                  latest_margin = margin_df.iloc[-1]
+                  data["margin_balance"] = round(float(latest_margin.get("rzye", 0)) / 100000000, 2)
+              else:
+                  data["margin_balance"] = "暂无实时数据"
+          except Exception:
+              data["margin_balance"] = "暂无实时数据"
+
+          try:
+              omo_df = ak.repo_rate_hist_em()
+              if not omo_df.empty:
+                  latest_omo = omo_df.iloc[-1].to_dict()
+                  data["omo_mature"] = latest_omo.get("到期量", "见央行早间公告")
+                  data["omo_inject"] = latest_omo.get("投放量", "见央行早间公告")
+              else:
+                  data["omo_mature"], data["omo_inject"] = "见央行早间公告", "见央行早间公告"
+          except Exception:
+              data["omo_mature"], data["omo_inject"] = "见央行早间公告", "见央行早间公告"
+
+          # 写入 JSON
           with open("data.json", "w", encoding="utf-8") as f:
               json.dump(data, f, ensure_ascii=False, indent=2)
           '
 
-      - name: 保存并提交 data.json 到仓库
+      - name: 提交并推送最新数据
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add data.json
-          git commit -m "update data.json" || echo "No changes to commit"
+          git commit -m "update full morning data [skip ci]" || echo "无变动"
           git push
