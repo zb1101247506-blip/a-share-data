@@ -1,0 +1,57 @@
+name: Stock Data Crawler
+
+on:
+  schedule:
+    # 每周一至周五北京时间 08:30 自动执行 (对应 UTC 00:30)
+    - cron: '30 0 * * 1-5'
+  workflow_dispatch: # 开启手动测试按钮
+
+jobs:
+  fetch-and-save:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 抓取市场客观数据
+        run: |
+          python -m pip install --quiet akshare requests
+          python -c '
+          import requests, datetime, json, akshare as ak
+
+          data = {}
+          # 1. 抓取富时A50、离岸汇率与外盘
+          try:
+              headers = {"Referer": "https://finance.sina.com.cn"}
+              r = requests.get("https://hq.sinajs.cn/list=hf_CHA50CFD,fx_susdcnh,gb_ixic", headers=headers, timeout=10)
+              lines = r.text.strip().split("\n")
+              a50_items = lines[0].split("=\"")[1].split(",")
+              data["a50_price"] = a50_items[0]
+              data["usdcnh"] = lines[1].split("=\"")[1].split(",")[1]
+              ixic_items = lines[2].split("=\"")[1].split(",")
+              data["nasdaq_pct"] = ixic_items[2] if len(ixic_items) > 2 else "0.0"
+          except:
+              data["a50_price"], data["usdcnh"], data["nasdaq_pct"] = "暂无", "暂无", "暂无"
+
+          # 2. 前日短线生态数据
+          try:
+              last_date = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%Y%m%d")
+              zt_df = ak.stock_zt_pool_em(date=last_date)
+              data["limit_up_count"] = len(zt_df)
+              data["max_board"] = int(zt_df["连板数"].max()) if not zt_df.empty else 0
+              top_name = zt_df.sort_values(by="连板数", ascending=False).iloc[0]["名称"] if not zt_df.empty else "无"
+              data["max_board_name"] = top_name
+          except:
+              data["limit_up_count"], data["max_board"], data["max_board_name"] = 0, 0, "暂无"
+
+          with open("data.json", "w", encoding="utf-8") as f:
+              json.dump(data, f, ensure_ascii=False, indent=2)
+          '
+
+      - name: 保存并提交 data.json 到仓库
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add data.json
+          git commit -m "update data.json" || echo "No changes to commit"
+          git push
