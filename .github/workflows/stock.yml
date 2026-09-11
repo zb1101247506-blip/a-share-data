@@ -20,7 +20,7 @@ jobs:
       - name: 安装依赖并抓取全量数据
         run: |
           pip install --quiet akshare requests pandas
-          python fetch.py
+          python crawler.py
 
       - name: 提交并推送最新数据
         run: |
