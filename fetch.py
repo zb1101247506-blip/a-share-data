@@ -6,11 +6,18 @@ import pandas as pd
 import akshare as ak
 
 data = {}
-headers = {"Referer": "https://finance.sina.com.cn"}
+headers = {
+    "Referer": "https://finance.sina.com.cn",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+}
 
-# 1. 抓取外盘、期指、汇率与大宗商品
+# 1. 抓取外盘、A股基准、期指、汇率与大宗商品 (全部合并至轻量级新浪接口)
 try:
-    symbols = "hf_CHA50CFD,fx_susdcnh,DXY,hf_CL,hf_GC,hf_CAD,gb_$dji,gb_ixic,gb_inx,gb_nvda,gb_tsla,gb_aapl,gb_hxc"
+    # 注意：美元指数为 DINIW，增加 s_sh000001(上证综合指数快照)
+    symbols = (
+        "hf_CHA50CFD,fx_susdcnh,DINIW,hf_CL,hf_GC,hf_CAD,"
+        "gb_$dji,gb_ixic,gb_inx,gb_nvda,gb_tsla,gb_aapl,gb_hxc,s_sh000001"
+    )
     r = requests.get(f"https://hq.sinajs.cn/list={symbols}", headers=headers, timeout=10)
     lines = r.text.strip().split("\n")
     raw_dict = {}
@@ -35,8 +42,8 @@ try:
     cnh = raw_dict.get("fx_susdcnh", [])
     data["usdcnh"] = cnh[1] if len(cnh) > 1 else "暂无实时数据"
 
-    # 美元指数 DXY
-    dxy = raw_dict.get("DXY", [])
+    # 美元指数 (代码: DINIW)
+    dxy = raw_dict.get("DINIW", [])
     data["dxy_price"] = dxy[1] if len(dxy) > 1 else "暂无实时数据"
 
     # 美股三大指数涨跌幅
@@ -44,27 +51,35 @@ try:
     data["ixic_pct"] = raw_dict.get("gb_ixic", ["","","0.0"])[2]
     data["spx_pct"] = raw_dict.get("gb_inx", ["","","0.0"])[2]
 
-    # 美股科技锚与金龙指数
+    # 美股科技与金龙指数
     data["nvda_pct"] = raw_dict.get("gb_nvda", ["","","0.0"])[2]
     data["tsla_pct"] = raw_dict.get("gb_tsla", ["","","0.0"])[2]
     data["aapl_pct"] = raw_dict.get("gb_aapl", ["","","0.0"])[2]
     data["hxc_pct"] = raw_dict.get("gb_hxc", ["","","0.0"])[2]
 
-    # 战略大宗商品
+    # 大宗商品
     data["crude_oil"] = raw_dict.get("hf_CL", ["暂无"])[0]
     data["gold"] = raw_dict.get("hf_GC", ["暂无"])[0]
     data["copper"] = raw_dict.get("hf_CAD", ["暂无"])[0]
+
+    # 上证指数收盘价/实时现价 (s_sh000001: 索引1是当前点位)
+    sh_data = raw_dict.get("s_sh000001", [])
+    data["sh_close"] = float(sh_data[1]) if len(sh_data) > 1 else 0.0
+
 except Exception as e:
+    print(f"外盘/行情接口抓取异常: {e}")
     data["macro_error"] = str(e)
 
-# 2. 自动回溯最近交易日
+
+# 2. 计算最近交易日
 target_date = datetime.datetime.now() - datetime.timedelta(days=1)
 while target_date.weekday() >= 5:
     target_date -= datetime.timedelta(days=1)
 trade_date_str = target_date.strftime("%Y%m%d")
 data["trade_date"] = trade_date_str
 
-# 3. 短线生态指标 (涨跌停、连板、炸板)
+
+# 3. 短线连板生态 (AkShare 东方财富涨跌停池)
 try:
     zt_df = ak.stock_zt_pool_em(date=trade_date_str)
     data["limit_up_count"] = len(zt_df)
@@ -82,40 +97,48 @@ try:
     broken_count = len(zbf_df) if not zbf_df.empty else 0
     total_pool = len(zt_df) + broken_count
     data["broken_rate"] = round((broken_count / total_pool) * 100, 2) if total_pool > 0 else 0.0
-except Exception:
+except Exception as e:
+    print(f"涨跌停池数据拉取异常: {e}")
     data["limit_up_count"], data["limit_down_count"] = 0, 0
     data["max_board"], data["max_board_name"], data["broken_rate"] = 0, "暂无", 0.0
 
-# 4. 指数基准收盘价
-try:
-    sh_df = ak.stock_zh_index_daily_em(symbol="sh000001")
-    data["sh_close"] = float(sh_df.iloc[-1]["close"])
-except Exception:
-    data["sh_close"] = 0.0
 
-# 5. 两融与 OMO
+# 4. 上交所两融余额
 try:
     margin_df = ak.stock_margin_sse()
     if not margin_df.empty:
-        data["margin_balance"] = round(float(margin_df.iloc[-1].get("rzye", 0)) / 100000000, 2)
+        # 正确匹配中文字段：融资余额 或 融资融券余额
+        last_row = margin_df.iloc[-1]
+        val = last_row.get("融资余额") or last_row.get("本日余额") or last_row.get("rzye")
+        if val is not None:
+            data["margin_balance"] = round(float(val) / 100000000, 2)
+        else:
+            data["margin_balance"] = "暂无数据"
     else:
-        data["margin_balance"] = "暂无实时数据"
-except Exception:
-    data["margin_balance"] = "暂无实时数据"
+        data["margin_balance"] = "暂无数据"
+except Exception as e:
+    print(f"两融数据拉取异常: {e}")
+    data["margin_balance"] = "暂无数据"
 
+
+# 5. 央行公开市场操作 (OMO)
 try:
-    omo_df = ak.repo_rate_hist_em()
+    # 使用正确的公开市场每日操作接口
+    omo_df = ak.macro_china_open_market_daily()
     if not omo_df.empty:
-        latest_omo = omo_df.iloc[-1].to_dict()
-        data["omo_mature"] = latest_omo.get("到期量", "见央行公告")
-        data["omo_inject"] = latest_omo.get("投放量", "见央行公告")
+        latest_row = omo_df.iloc[-1].to_dict()
+        # 兼容匹配常见表头字段
+        data["omo_mature"] = str(latest_row.get("逆回购到期", latest_row.get("到期量", "见央行公告")))
+        data["omo_inject"] = str(latest_row.get("逆回购操作", latest_row.get("投放量", "见央行公告")))
     else:
         data["omo_mature"], data["omo_inject"] = "见央行公告", "见央行公告"
-except Exception:
+except Exception as e:
+    print(f"OMO 数据拉取异常: {e}")
     data["omo_mature"], data["omo_inject"] = "见央行公告", "见央行公告"
 
-# 写入文件
+
+# 保存为 JSON
 with open("data.json", "w", encoding="utf-8") as f:
     json.dump(data, f, ensure_ascii=False, indent=2)
 
-print("抓取成功完成，数据已写入 data.json")
+print("抓取成功完成，数据已更新至 data.json")
