@@ -2,8 +2,10 @@ name: Stock Data Crawler Full
 
 on:
   schedule:
-    # UTC 00:26 对应 北京时间 08:26
-    - cron: '26 0 * * 1-5'
+    # 第一次触发：UTC 00:21（北京时间 08:21）
+    - cron: '21 0 * * 1-5'
+    # 第二次备用触发：UTC 00:33（北京时间 08:33）
+    - cron: '33 0 * * 1-5'
   workflow_dispatch:
 
 jobs:
